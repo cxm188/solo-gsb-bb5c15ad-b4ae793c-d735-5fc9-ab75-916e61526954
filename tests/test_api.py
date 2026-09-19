@@ -228,3 +228,147 @@ def test_enrichment_fit_parameter_bounds(client):
     peaks = [{"mass": 72.0, "intensity": -1.0}]
     resp = client.post("/api/v1/enrichment-fit", json=_fit_payload(peaks=peaks))
     assert resp.status_code == 422
+
+
+def _synthetic_dual_payload(formula, enrichments, **overrides):
+    parsed = parse_formula(formula)
+    distributions = {
+        sym: enriched_distribution(sym, mass_number, fraction)
+        for sym, (mass_number, fraction) in enrichments.items()
+    }
+    env = [(0.0, 1.0)]
+    for sym, count in parsed.composition.items():
+        base = list(distributions.get(sym, ISOTOPES[sym]))
+        env = convolve(env, power_polynomial(base, count, 0.0001, 1e-12), 0.0001, 1e-12)
+    peaks = [
+        {"mass": m, "intensity": i} for m, i in top_peaks(merge_peaks(env, 0.0001), 20)
+    ]
+    labels = [
+        {"label": f"{mass_number}{sym}", "step_percent": 1.0}
+        for sym, (mass_number, _) in enrichments.items()
+    ]
+    payload = {
+        "formula": formula,
+        "labels": labels,
+        "peaks": peaks,
+        "mass_tolerance": 0.05,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_dual_enrichment_fit_recovers_both_abundances(client):
+    payload = _synthetic_dual_payload(
+        "C4N2", {"C": (13, 0.4), "N": (15, 0.6)}
+    )
+    payload["labels"][0]["step_percent"] = 2.0
+    payload["labels"][1]["step_percent"] = 2.0
+    resp = client.post("/api/v1/dual-enrichment-fit", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [b["label"] for b in body["best_abundances"]] == ["13C", "15N"]
+    assert body["best_abundances"][0]["best_abundance_percent"] == pytest.approx(40.0)
+    assert body["best_abundances"][1]["best_abundance_percent"] == pytest.approx(60.0)
+    assert body["search_points"] == 51 * 51
+    assert body["mse"] == pytest.approx(0.0, abs=1e-6)
+    assert body["pair_count"] == len(body["pairs"])
+    # every observed peak appears exactly once in the pairing
+    seen = [p["observed_mass"] for p in body["pairs"] if p["observed_mass"] is not None]
+    assert len(seen) == len(payload["peaks"])
+
+
+def test_dual_enrichment_fit_endpoint_tie_lexicographic(client):
+    # H2O contains neither C nor N: all grid points tie -> (0, 0).
+    payload = {
+        "formula": "H2O",
+        "labels": [
+            {"label": "13C", "step_percent": 5.0},
+            {"label": "15N", "step_percent": 5.0},
+        ],
+        "peaks": [
+            {"mass": 18.010565, "intensity": 100.0},
+            {"mass": 19.01394, "intensity": 0.05},
+        ],
+        "mass_tolerance": 0.05,
+    }
+    resp = client.post("/api/v1/dual-enrichment-fit", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["best_abundances"][0]["best_abundance_percent"] == 0.0
+    assert body["best_abundances"][1]["best_abundance_percent"] == 0.0
+    assert body["search_points"] == 21 * 21
+
+
+def test_dual_enrichment_fit_duplicate_element_labels_422(client):
+    payload = _synthetic_dual_payload("C6", {"C": (13, 0.5)})
+    payload["labels"] = [
+        {"label": "13C", "step_percent": 5.0},
+        {"label": "12C", "step_percent": 5.0},
+    ]
+    resp = client.post("/api/v1/dual-enrichment-fit", json=payload)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_labels"
+    assert detail["index"] == 1
+    assert "different elements" in detail["message"]
+
+
+def test_dual_enrichment_fit_same_label_twice_422(client):
+    payload = _synthetic_dual_payload("C6", {"C": (13, 0.5)})
+    payload["labels"] = [
+        {"label": "13C", "step_percent": 5.0},
+        {"label": "13C", "step_percent": 5.0},
+    ]
+    resp = client.post("/api/v1/dual-enrichment-fit", json=payload)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_labels"
+    assert detail["index"] == 1
+
+
+def test_dual_enrichment_fit_malformed_label_422(client):
+    # A malformed *second* label is reported via the position-aware
+    # invalid_label error rather than the duplicate-element error.
+    payload = _synthetic_dual_payload("C6N2", {"C": (13, 0.5), "N": (15, 0.5)})
+    payload["labels"][1] = {"label": "20N", "step_percent": 5.0}
+    resp = client.post("/api/v1/dual-enrichment-fit", json=payload)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_label"
+    assert detail["position"] == 0
+
+
+def test_dual_enrichment_fit_wrong_label_count_422(client):
+    payload = _synthetic_dual_payload("C6N2", {"C": (13, 0.5), "N": (15, 0.5)})
+    payload["labels"] = [payload["labels"][0]]
+    resp = client.post("/api/v1/dual-enrichment-fit", json=payload)
+    assert resp.status_code == 422
+    payload["labels"] = [
+        {"label": "13C"}, {"label": "15N"}, {"label": "18O"}
+    ]
+    resp = client.post("/api/v1/dual-enrichment-fit", json=payload)
+    assert resp.status_code == 422
+
+
+def test_dual_enrichment_fit_step_bounds_and_peak_validation(client):
+    payload = _synthetic_dual_payload("C6N2", {"C": (13, 0.5), "N": (15, 0.5)})
+    payload["labels"][1]["step_percent"] = 0.4
+    assert client.post("/api/v1/dual-enrichment-fit", json=payload).status_code == 422
+    payload["labels"][1]["step_percent"] = 10.5
+    assert client.post("/api/v1/dual-enrichment-fit", json=payload).status_code == 422
+
+    payload = _synthetic_dual_payload("C6N2", {"C": (13, 0.5), "N": (15, 0.5)})
+    payload["mass_tolerance"] = 0.0
+    assert client.post("/api/v1/dual-enrichment-fit", json=payload).status_code == 422
+
+    payload = _synthetic_dual_payload("C6N2", {"C": (13, 0.5), "N": (15, 0.5)})
+    payload["peaks"] = []
+    resp = client.post("/api/v1/dual-enrichment-fit", json=payload)
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "invalid_peaks"
+
+    payload = _synthetic_dual_payload("C6N2", {"C": (13, 0.5), "N": (15, 0.5)})
+    payload["formula"] = "C6Xx2"
+    resp = client.post("/api/v1/dual-enrichment-fit", json=payload)
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "invalid_formula"

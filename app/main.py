@@ -11,7 +11,9 @@ from pydantic import BaseModel, Field
 from . import __version__, db
 from .config import settings
 from .enrichment import (
+    LabelCombinationError,
     PeakListError,
+    fit_dual_enrichment,
     fit_enrichment,
     normalise_base_peak,
     validate_observed_peaks,
@@ -38,7 +40,8 @@ app = FastAPI(
         "polynomial convolution) and monoisotopic masses for molecular "
         "formulas, with optional pure-isotope labels such as [13C]; also "
         "estimates single-isotope enrichment by fitting candidate "
-        "abundances against observed peaks."
+        "abundances against observed peaks, or jointly fits two isotopes of "
+        "different elements on a 2-D abundance grid."
     ),
     lifespan=lifespan,
 )
@@ -125,6 +128,59 @@ class EnrichmentFitResponse(BaseModel):
     pairs: list[PeakPairOut]
 
 
+class DualLabelSpec(BaseModel):
+    label: str = Field(
+        ...,
+        description="Isotope label to estimate, e.g. '13C'",
+        examples=["13C"],
+    )
+    step_percent: float = Field(
+        1.0,
+        ge=0.5,
+        le=10.0,
+        description="Abundance grid step in percentage points (0.5-10)",
+    )
+
+
+class DualEnrichmentFitRequest(BaseModel):
+    formula: str = Field(
+        ...,
+        description="Molecular formula, e.g. 'C6H12O6' or 'C6H6[13C]2'",
+        examples=["C6H12O6"],
+    )
+    labels: list[DualLabelSpec] = Field(
+        ...,
+        min_length=2,
+        max_length=2,
+        description="Exactly two isotope labels, which must target different elements",
+        examples=[[{"label": "13C", "step_percent": 1.0}, {"label": "15N", "step_percent": 1.0}]],
+    )
+    peaks: list[ObservedPeak] = Field(
+        ...,
+        max_length=200,
+        description="Observed peaks, sorted by strictly increasing mass",
+    )
+    mass_tolerance: float = Field(
+        ...,
+        gt=0,
+        description="Mass tolerance (Da) for pairing observed/predicted peaks",
+    )
+
+
+class BestAbundanceOut(BaseModel):
+    label: str
+    best_abundance_percent: float
+
+
+class DualEnrichmentFitResponse(BaseModel):
+    formula: str
+    best_abundances: list[BestAbundanceOut]
+    mse: float
+    search_points: int
+    pair_count: int
+    pairs: list[PeakPairOut]
+
+
 @app.exception_handler(FormulaError)
 async def formula_error_handler(request: Request, exc: FormulaError) -> JSONResponse:
     return JSONResponse(
@@ -160,6 +216,22 @@ async def peak_list_error_handler(request: Request, exc: PeakListError) -> JSONR
         content={
             "detail": {
                 "error": "invalid_peaks",
+                "message": exc.message,
+                "index": exc.index,
+            }
+        },
+    )
+
+
+@app.exception_handler(LabelCombinationError)
+async def label_combination_error_handler(
+    request: Request, exc: LabelCombinationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "error": "invalid_labels",
                 "message": exc.message,
                 "index": exc.index,
             }
@@ -214,6 +286,30 @@ def envelope(req: EnvelopeRequest) -> dict:
     return result
 
 
+def _build_pairs(
+    observed: list[tuple[float, float]],
+    fit_pairs: list[tuple[int | None, int | None]],
+    predicted: list[tuple[float, float]],
+) -> list[dict]:
+    """Serialise the best-fit pairing, sorted by mass (observed first)."""
+    obs = normalise_base_peak(observed)
+    pairs = [
+        {
+            "observed_mass": round(obs[i][0], 6) if i is not None else None,
+            "observed_intensity": round(obs[i][1], 6) if i is not None else None,
+            "predicted_mass": round(predicted[j][0], 6) if j is not None else None,
+            "predicted_intensity": round(predicted[j][1], 6) if j is not None else None,
+        }
+        for i, j in fit_pairs
+    ]
+    pairs.sort(
+        key=lambda p: p["observed_mass"]
+        if p["observed_mass"] is not None
+        else p["predicted_mass"]
+    )
+    return pairs
+
+
 @app.post("/api/v1/enrichment-fit", response_model=EnrichmentFitResponse)
 def enrichment_fit(req: EnrichmentFitRequest) -> dict:
     """Estimate the abundance of a single isotope label by fitting the
@@ -235,25 +331,60 @@ def enrichment_fit(req: EnrichmentFitRequest) -> dict:
         prune=settings.prune_threshold,
     )
 
-    obs = normalise_base_peak(observed)
-    pairs = [
-        {
-            "observed_mass": round(obs[i][0], 6) if i is not None else None,
-            "observed_intensity": round(obs[i][1], 6) if i is not None else None,
-            "predicted_mass": round(fit.predicted[j][0], 6) if j is not None else None,
-            "predicted_intensity": round(fit.predicted[j][1], 6) if j is not None else None,
-        }
-        for i, j in fit.pairs
-    ]
-    pairs.sort(
-        key=lambda p: p["observed_mass"]
-        if p["observed_mass"] is not None
-        else p["predicted_mass"]
-    )
+    pairs = _build_pairs(observed, fit.pairs, fit.predicted)
     return {
         "formula": req.formula,
         "label": req.label,
         "best_abundance_percent": round(fit.best_abundance_percent, 6),
+        "mse": fit.mse,
+        "search_points": fit.search_points,
+        "pair_count": len(pairs),
+        "pairs": pairs,
+    }
+
+
+@app.post(
+    "/api/v1/dual-enrichment-fit", response_model=DualEnrichmentFitResponse
+)
+def dual_enrichment_fit(req: DualEnrichmentFitRequest) -> dict:
+    """Jointly estimate the abundances of two isotope labels (on different
+    elements) by fitting the computed envelope against observed peaks over
+    a 2-D 0-100% grid."""
+    parsed = parse_formula(req.formula)
+    parsed_labels = [parse_label(spec.label) for spec in req.labels]
+
+    observed = [(p.mass, p.intensity) for p in req.peaks]
+    validate_observed_peaks(observed)
+
+    # Labels targeting the same element are rejected here with a locatable
+    # index; parse_label above already covered malformed/unknown labels.
+    if parsed_labels[0][0] == parsed_labels[1][0]:
+        raise LabelCombinationError(
+            f"The two labels must target different elements, but "
+            f"'{req.labels[1].label}' targets element "
+            f"'{parsed_labels[1][0]}' already named by "
+            f"'{req.labels[0].label}'",
+            1,
+        )
+
+    fit = fit_dual_enrichment(
+        parsed,
+        parsed_labels[0],
+        parsed_labels[1],
+        observed,
+        step_percent=(req.labels[0].step_percent, req.labels[1].step_percent),
+        mass_tolerance=req.mass_tolerance,
+        merge_tolerance=settings.merge_tolerance,
+        prune=settings.prune_threshold,
+    )
+
+    pairs = _build_pairs(observed, fit.pairs, fit.predicted)
+    return {
+        "formula": req.formula,
+        "best_abundances": [
+            {"label": req.labels[k].label, "best_abundance_percent": round(pct, 6)}
+            for k, pct in enumerate(fit.best_abundances_percent)
+        ],
         "mse": fit.mse,
         "search_points": fit.search_points,
         "pair_count": len(pairs),
