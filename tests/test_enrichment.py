@@ -1,9 +1,11 @@
 import pytest
 
 from app.enrichment import (
+    LabelPairError,
     PeakListError,
     abundance_grid,
     enriched_distribution,
+    fit_dual_enrichment,
     fit_enrichment,
     normalise_base_peak,
     pair_and_score,
@@ -25,6 +27,23 @@ def synthetic_peaks(formula, symbol, mass_number, fraction, top=10):
     env = [(0.0, 1.0)]
     for sym, count in parsed.composition.items():
         base = list(dist) if sym == symbol else list(ISOTOPES[sym])
+        env = convolve(env, power_polynomial(base, count, TOL, PRUNE), TOL, PRUNE)
+    return top_peaks(merge_peaks(env, TOL), top)
+
+
+def synthetic_peaks_dual(formula, enrichments, top=10):
+    """Observed-style peaks for ``formula`` with two elements enriched.
+
+    ``enrichments`` maps element symbol to (mass_number, fraction).
+    """
+    parsed = parse_formula(formula)
+    distributions = {
+        sym: enriched_distribution(sym, mass_number, fraction)
+        for sym, (mass_number, fraction) in enrichments.items()
+    }
+    env = [(0.0, 1.0)]
+    for sym, count in parsed.composition.items():
+        base = list(distributions.get(sym, ISOTOPES[sym]))
         env = convolve(env, power_polynomial(base, count, TOL, PRUNE), TOL, PRUNE)
     return top_peaks(merge_peaks(env, TOL), top)
 
@@ -169,3 +188,87 @@ def test_fit_enrichment_tie_picks_lower_abundance():
         merge_tolerance=TOL, prune=PRUNE,
     )
     assert fit.best_abundance_percent == 0.0
+
+
+def test_fit_dual_enrichment_recovers_both_abundances():
+    observed = synthetic_peaks_dual(
+        "C4O2", {"C": (13, 0.5), "O": (18, 0.4)}, top=200
+    )
+    fit = fit_dual_enrichment(
+        parse_formula("C4O2"), ("C", 13), ("O", 18), observed,
+        step_a_percent=10.0, step_b_percent=10.0,
+        mass_tolerance=0.005, merge_tolerance=TOL, prune=PRUNE,
+    )
+    assert fit.best_abundances_percent == pytest.approx((50.0, 40.0))
+    assert fit.mse == pytest.approx(0.0, abs=1e-9)
+    assert fit.search_points == 11 * 11
+
+
+def test_fit_dual_enrichment_coarse_grids_pick_nearest():
+    observed = synthetic_peaks_dual(
+        "C4O2", {"C": (13, 0.42), "O": (18, 0.62)}, top=200
+    )
+    fit = fit_dual_enrichment(
+        parse_formula("C4O2"), ("C", 13), ("O", 18), observed,
+        step_a_percent=10.0, step_b_percent=10.0,
+        mass_tolerance=0.005, merge_tolerance=TOL, prune=PRUNE,
+    )
+    assert fit.best_abundances_percent == pytest.approx((40.0, 60.0))
+    assert fit.search_points == 121
+
+
+def test_fit_dual_enrichment_tie_picks_lexicographic_minimum():
+    # Formula contains neither enriched element: every grid point scores
+    # identically, so (0, 0) must win.
+    observed = synthetic_peaks("H2O", "C", 13, 0.5, top=5)
+    fit = fit_dual_enrichment(
+        parse_formula("H2O"), ("C", 13), ("N", 15), observed,
+        step_a_percent=5.0, step_b_percent=10.0,
+        mass_tolerance=0.05, merge_tolerance=TOL, prune=PRUNE,
+    )
+    assert fit.best_abundances_percent == (0.0, 0.0)
+    assert fit.search_points == 21 * 11
+
+
+def test_fit_dual_enrichment_one_element_absent_from_formula():
+    # 13C on C6 fitted jointly with 15N on a nitrogen-free molecule:
+    # the 15N dimension is degenerate, so its lexicographically smallest
+    # value (0) is taken while 13C is recovered.
+    observed = synthetic_peaks("C6", "C", 13, 0.5, top=7)
+    fit = fit_dual_enrichment(
+        parse_formula("C6"), ("C", 13), ("N", 15), observed,
+        step_a_percent=0.5, step_b_percent=5.0,
+        mass_tolerance=0.005, merge_tolerance=TOL, prune=PRUNE,
+    )
+    assert fit.best_abundances_percent[0] == pytest.approx(50.0)
+    assert fit.best_abundances_percent[1] == 0.0
+    assert fit.search_points == 201 * 21
+
+
+def test_fit_dual_enrichment_rejects_same_element_labels():
+    observed = synthetic_peaks("C6", "C", 13, 0.5, top=7)
+    with pytest.raises(LabelPairError) as excinfo:
+        fit_dual_enrichment(
+            parse_formula("C6"), ("C", 12), ("C", 13), observed,
+            step_a_percent=5.0, step_b_percent=5.0,
+            mass_tolerance=0.05, merge_tolerance=TOL, prune=PRUNE,
+        )
+    assert excinfo.value.index == 1
+    assert "'C'" in excinfo.value.message
+
+
+def test_fit_dual_enrichment_matches_single_fit_when_second_is_natural():
+    # With the second element pinned at its natural isotope (15N at 0% on a
+    # nitrogen-free molecule) the best 13C value matches the single fit.
+    observed = synthetic_peaks("C6", "C", 13, 0.5, top=7)
+    single = fit_enrichment(
+        parse_formula("C6"), "C", 13, observed,
+        step_percent=5.0, mass_tolerance=0.005,
+        merge_tolerance=TOL, prune=PRUNE,
+    )
+    dual = fit_dual_enrichment(
+        parse_formula("C6"), ("C", 13), ("N", 15), observed,
+        step_a_percent=5.0, step_b_percent=50.0,
+        mass_tolerance=0.005, merge_tolerance=TOL, prune=PRUNE,
+    )
+    assert dual.best_abundances_percent[0] == single.best_abundance_percent

@@ -8,6 +8,12 @@ the existing convolution machinery, normalised to base peak = 100 (as are
 the observed peaks), and paired with the observed peaks by nearest mass
 within a tolerance. The abundance minimising the intensity mean squared
 error wins; ties go to the lower abundance.
+
+A dual-label variant (:func:`fit_dual_enrichment`) grid-searches two labels
+on *different* elements jointly: the abundance-independent envelope (every
+other element) and each labelled element's per-grid-point polynomial are
+each computed once and then combined on the 2-D grid. MSE ties are broken
+by lexicographic (first label, second label) abundance order.
 """
 
 from __future__ import annotations
@@ -24,6 +30,16 @@ class PeakListError(ValueError):
     index of the offending peak (``None`` when not index-specific)."""
 
     def __init__(self, message: str, index: int | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.index = index
+
+
+class LabelPairError(ValueError):
+    """Validation error for a pair of dual-fit labels, carrying the 0-based
+    index of the offending label in the request's ``labels`` list."""
+
+    def __init__(self, message: str, index: int) -> None:
         super().__init__(message)
         self.message = message
         self.index = index
@@ -217,5 +233,118 @@ def fit_enrichment(
         if best is None or mse < best.mse:
             best = FitResult(pct, mse, len(grid), pairs, pred)
     # The grid always spans 0–100%, so a best candidate always exists.
+    assert best is not None
+    return best
+
+
+@dataclass
+class DualFitResult:
+    best_abundances_percent: tuple[float, float]
+    mse: float
+    search_points: int
+    # (observed_index | None, predicted_index | None) pairs at the best fit
+    pairs: list[tuple[int | None, int | None]]
+    predicted: list[Peak]  # normalised envelope at the best abundances
+
+
+def _envelope_excluding_two(
+    parsed: ParsedFormula, symbol_a: str, symbol_b: str, tolerance: float, prune: float
+) -> list[Peak]:
+    """Natural-abundance envelope of every element except the two labelled
+    elements (computed once and reused over the whole 2-D grid)."""
+    envelope: list[Peak] = [(0.0, 1.0)]
+    for sym, count in parsed.composition.items():
+        if sym == symbol_a or sym == symbol_b:
+            continue
+        element_poly = power_polynomial(list(ISOTOPES[sym]), count, tolerance, prune)
+        envelope = convolve(envelope, element_poly, tolerance, prune)
+    return envelope
+
+
+def _element_grid_polynomials(
+    parsed: ParsedFormula,
+    symbol: str,
+    mass_number: int,
+    grid: list[float],
+    tolerance: float,
+    prune: float,
+) -> list[list[Peak]]:
+    """Raised isotope polynomial of ``symbol`` for every grid abundance
+    (computed once per grid point and reused across the other dimension)."""
+    count = parsed.composition.get(symbol, 0)
+    if not count:
+        # Element absent from the formula: a unit factor for every point.
+        return [[(0.0, 1.0)] for _ in grid]
+    return [
+        power_polynomial(
+            list(enriched_distribution(symbol, mass_number, pct / 100.0)),
+            count,
+            tolerance,
+            prune,
+        )
+        for pct in grid
+    ]
+
+
+def fit_dual_enrichment(
+    parsed: ParsedFormula,
+    label_a: tuple[str, int],
+    label_b: tuple[str, int],
+    observed: list[Peak],
+    step_a_percent: float,
+    step_b_percent: float,
+    mass_tolerance: float,
+    merge_tolerance: float,
+    prune: float,
+) -> DualFitResult:
+    """Grid-search two label abundances (each 0–100%) jointly. The two
+    labels must belong to **different** elements; same-element pairs raise
+    :class:`LabelPairError`.
+
+    ``observed`` must be sorted by strictly increasing mass with
+    non-negative intensities, at least one of them positive. On an MSE tie
+    the lexicographically smallest ``(abundance_a, abundance_b)`` wins;
+    iterating ``a`` in the outer loop and ``b`` in the inner loop visits
+    points in exactly that order.
+    """
+    symbol_a, mass_number_a = label_a
+    symbol_b, mass_number_b = label_b
+    if symbol_a == symbol_b:
+        raise LabelPairError(
+            f"The two labels must target different elements; both target "
+            f"element '{symbol_a}'",
+            1,
+        )
+
+    obs = normalise_base_peak(observed)
+    rest = _envelope_excluding_two(
+        parsed, symbol_a, symbol_b, merge_tolerance, prune
+    )
+    grid_a = abundance_grid(step_a_percent)
+    grid_b = abundance_grid(step_b_percent)
+    polys_a = _element_grid_polynomials(
+        parsed, symbol_a, mass_number_a, grid_a, merge_tolerance, prune
+    )
+    polys_b = _element_grid_polynomials(
+        parsed, symbol_b, mass_number_b, grid_b, merge_tolerance, prune
+    )
+    shift = label_mass_shift(parsed)
+
+    best: DualFitResult | None = None
+    for ia, pct_a in enumerate(grid_a):
+        for ib, pct_b in enumerate(grid_b):
+            # rest is independent of both abundances; each element
+            # polynomial is reused across the other grid dimension.
+            envelope = convolve(rest, polys_a[ia], merge_tolerance, prune)
+            envelope = convolve(envelope, polys_b[ib], merge_tolerance, prune)
+            if shift:
+                envelope = [(m + shift, i) for m, i in envelope]
+            envelope = merge_peaks(envelope, merge_tolerance)
+            pred = normalise_base_peak(envelope)
+            pairs, mse = pair_and_score(obs, pred, mass_tolerance)
+            # Strict improvement only: ties keep the first point visited,
+            # i.e. the lexicographically smallest abundance pair.
+            if best is None or mse < best.mse:
+                best = DualFitResult((pct_a, pct_b), mse, len(grid_a) * len(grid_b), pairs, pred)
     assert best is not None
     return best
